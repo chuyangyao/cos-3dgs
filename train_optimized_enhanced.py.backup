@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""
+train_optimized_enhanced.py
+基于train_optimized的增强版本，集成高频细节优化
+渐进式频率训练策略：先低频后高频，并加入高频增强功能
+"""
+
+import os
+import sys
+import time
+import torch
+import torch.nn.functional as F
+import numpy as np
+import gc
+from tqdm import tqdm
+from random import randint
+from argparse import ArgumentParser, Namespace
+import uuid
+
+# 导入必要模块
+from scene import Scene
+from gaussian_renderer import render
+from scene.gaussian_model import GaussianModel
+from arguments import ModelParams, OptimizationParams, PipelineParams
+from utils.general_utils import safe_state
+from utils.loss_utils import l1_loss, ssim
+from utils.image_utils import psnr
+
+# 混合精度训练
+from torch.cuda.amp import autocast, GradScaler
+
+# TensorBoard
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+
+# ============================================================
+# 高频增强：基于图像梯度的Wave初始化
+# ============================================================
+def initialize_wave_by_image_gradient(gaussians, scene, opt, pipe, white_background=False):
+    """
+    基于多视角图像梯度分析的智能Wave初始化
+    专门增强高频细节区域的表达能力
+    """
+    device = gaussians._xyz.device
+    N = gaussians._xyz.shape[0]
+    
+    print("\n[Wave Init] Starting gradient-based initialization...")
+    
+    # 初始化累加器
+    gradient_accumulator = torch.zeros(N, device=device)
+    visibility_counter = torch.zeros(N, device=device)
+    spatial_gradient_map = torch.zeros(N, 3, device=device)
+    
+    # 采样训练视角
+    train_cameras = scene.getTrainCameras()
+    sample_size = min(10, len(train_cameras))
+    sample_indices = torch.randperm(len(train_cameras))[:sample_size]
+    sample_cameras = [train_cameras[idx] for idx in sample_indices]
+    
+    print(f"[Wave Init] Analyzing {sample_size} views for gradient information...")
+    
+    # 创建背景（根据场景设置）
+    bg_color = [1, 1, 1] if white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device=device)
+    
+    with torch.no_grad():
+        for cam_idx, camera in enumerate(sample_cameras):
+            # 修复：render函数使用正确的参数顺序
+            # render(viewpoint_camera, pc, pipe, bg_color)
+            # 这里pipe参数传None，bg_color传background
+            render_pkg = render(camera, gaussians, pipe, background)  # 修复的关键行
+            
+            rendered = render_pkg["render"]
+            gt = camera.original_image.cuda()
+            visibility = render_pkg["visibility_filter"]
+            
+            # 转换为灰度图
+            rendered_gray = 0.299 * rendered[0] + 0.587 * rendered[1] + 0.114 * rendered[2]
+            gt_gray = 0.299 * gt[0] + 0.587 * gt[1] + 0.114 * gt[2]
+            
+            # Sobel梯度计算
+            sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                                  dtype=torch.float32, device=device).view(1, 1, 3, 3)
+            sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                                  dtype=torch.float32, device=device).view(1, 1, 3, 3)
+            
+            # 应用Sobel滤波器
+            rendered_gray_batch = rendered_gray.unsqueeze(0).unsqueeze(0)
+            gt_gray_batch = gt_gray.unsqueeze(0).unsqueeze(0)
+            
+            grad_x_r = F.conv2d(rendered_gray_batch, sobel_x, padding=1)
+            grad_y_r = F.conv2d(rendered_gray_batch, sobel_y, padding=1)
+            grad_x_gt = F.conv2d(gt_gray_batch, sobel_x, padding=1)
+            grad_y_gt = F.conv2d(gt_gray_batch, sobel_y, padding=1)
+            
+            # 计算梯度幅值
+            grad_mag_r = torch.sqrt(grad_x_r**2 + grad_y_r**2 + 1e-8)
+            grad_mag_gt = torch.sqrt(grad_x_gt**2 + grad_y_gt**2 + 1e-8)
+            
+            # 梯度差异（需要重建的高频细节）
+            grad_diff = torch.abs(grad_mag_gt - grad_mag_r).squeeze()
+            
+            # 计算局部纹理丰富度
+            window_size = 7
+            unfold = torch.nn.Unfold(kernel_size=window_size, stride=1, padding=window_size//2)
+            gt_patches = unfold(gt_gray_batch)
+            local_variance = gt_patches.var(dim=1).reshape(gt_gray.shape)
+            
+            # 综合高频需求分数
+            high_freq_need = grad_diff * 0.7 + local_variance * 0.3
+            mean_high_freq = high_freq_need.mean().item()
+            
+            # 累积到可见高斯
+            if visibility.sum() > 0:
+                view_weight = 1.0 / sample_size
+                gradient_accumulator[visibility] += mean_high_freq * view_weight
+                visibility_counter[visibility] += view_weight
+                
+                # 记录方向性信息
+                if cam_idx < 3:
+                    random_dir = torch.randn(visibility.sum(), 3, device=device)
+                    random_dir = random_dir / (torch.norm(random_dir, dim=1, keepdim=True) + 1e-8)
+                    spatial_gradient_map[visibility] += random_dir * mean_high_freq
+    
+    print("[Wave Init] Gradient analysis complete. Setting wave vectors...")
+    
+    # 初始化wave向量
+    wave_init = torch.zeros((N, 3), device=device)
+    
+    # 处理有梯度信息的高斯
+    valid_mask = visibility_counter > 0
+    if valid_mask.sum() > 0:
+        # 平均梯度信息
+        gradient_accumulator[valid_mask] /= visibility_counter[valid_mask]
+        
+        # 归一化
+        grad_scores = gradient_accumulator[valid_mask]
+        grad_min, grad_max = grad_scores.min(), grad_scores.max()
+        if grad_max > grad_min:
+            grad_scores = (grad_scores - grad_min) / (grad_max - grad_min)
+        
+        # 非线性映射增强对比度
+        grad_scores = torch.pow(grad_scores, 0.7)
+        
+        # 设置wave幅度范围
+        min_wave = 0.0
+        max_wave = 2.0 if opt.enable_high_freq_enhancement else 1.0
+        target_wave_norm = min_wave + (max_wave - min_wave) * grad_scores
+        
+        # 确定wave方向
+        wave_directions = spatial_gradient_map[valid_mask]
+        wave_dir_norms = torch.norm(wave_directions, dim=1, keepdim=True)
+        
+        # 没有方向信息的使用随机方向
+        no_direction_mask = wave_dir_norms.squeeze() < 1e-8
+        if no_direction_mask.any():
+            random_directions = torch.randn(no_direction_mask.sum(), 3, device=device)
+            random_directions = random_directions / (torch.norm(random_directions, dim=1, keepdim=True) + 1e-8)
+            wave_directions[no_direction_mask] = random_directions
+        
+        # 归一化方向
+        wave_directions = wave_directions / (torch.norm(wave_directions, dim=1, keepdim=True) + 1e-8)
+        
+        # 组合幅度和方向
+        wave_init[valid_mask] = wave_directions * target_wave_norm.unsqueeze(1)
+        
+        # 添加小的随机扰动
+        if opt.wave_init_noise > 0:
+            noise = torch.randn_like(wave_init[valid_mask]) * opt.wave_init_noise
+            wave_init[valid_mask] += noise
+    
+    # 没有梯度信息的高斯给予小的随机初始化
+    invalid_mask = ~valid_mask
+    if invalid_mask.sum() > 0:
+        small_random = torch.randn(invalid_mask.sum(), 3, device=device) * 0.05
+        wave_init[invalid_mask] = small_random
+    
+    # 限制最大wave
+    if opt.max_wave_norm > 0:
+        wave_norms = torch.norm(wave_init, dim=1, keepdim=True)
+        over_limit = wave_norms > opt.max_wave_norm
+        if over_limit.any():
+            wave_init[over_limit.squeeze()] *= (opt.max_wave_norm / wave_norms[over_limit.squeeze()])
+    
+    # 确保没有NaN或Inf
+    wave_init = torch.nan_to_num(wave_init, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # 应用到高斯模型
+    gaussians._wave.data = wave_init
+    
+    # 打印统计信息
+    final_norms = torch.norm(wave_init, dim=1)
+    print(f"\n[Wave Init] Initialization complete:")
+    print(f"  Active waves (norm > 0.01): {(final_norms > 0.01).sum().item()}/{N}")
+    print(f"  Mean norm: {final_norms.mean().item():.4f}")
+    print(f"  Max norm: {final_norms.max().item():.4f}")
+    
+    torch.cuda.empty_cache()
+    return wave_init
+
+
+# ============================================================
+# 高频细节损失函数
+# ============================================================
+def compute_high_frequency_detail_loss(rendered, gt, wave_vectors=None, opt=None):
+    """
+    专门针对高频细节的损失函数
+    """
+    device = rendered.device
+    loss_dict = {}
+    
+    # 1. 边缘检测损失
+    laplacian_kernel = torch.tensor(
+        [[0, -1, 0], [-1, 4, -1], [0, -1, 0]], 
+        dtype=torch.float32, device=device
+    ).view(1, 1, 3, 3)
+    
+    # 转换为灰度
+    if rendered.dim() == 3:
+        rendered_gray = 0.299 * rendered[0] + 0.587 * rendered[1] + 0.114 * rendered[2]
+        gt_gray = 0.299 * gt[0] + 0.587 * gt[1] + 0.114 * gt[2]
+    else:
+        rendered_gray = 0.299 * rendered[:, 0] + 0.587 * rendered[:, 1] + 0.114 * rendered[:, 2]
+        gt_gray = 0.299 * gt[:, 0] + 0.587 * gt[:, 1] + 0.114 * gt[:, 2]
+    
+    rendered_gray = rendered_gray.unsqueeze(0).unsqueeze(0) if rendered_gray.dim() == 2 else rendered_gray.unsqueeze(1)
+    gt_gray = gt_gray.unsqueeze(0).unsqueeze(0) if gt_gray.dim() == 2 else gt_gray.unsqueeze(1)
+    
+    # 应用拉普拉斯滤波器
+    rendered_edges = F.conv2d(rendered_gray, laplacian_kernel, padding=1)
+    gt_edges = F.conv2d(gt_gray, laplacian_kernel, padding=1)
+    
+    edge_loss = F.l1_loss(rendered_edges, gt_edges)
+    loss_dict['edge'] = edge_loss.item()
+    
+    # 2. 局部纹理丰富度损失
+    window_size = 5
+    unfold = torch.nn.Unfold(kernel_size=window_size, stride=1, padding=window_size//2)
+    
+    rendered_patches = unfold(rendered_gray)
+    gt_patches = unfold(gt_gray)
+    
+    rendered_var = rendered_patches.var(dim=1, keepdim=True)
+    gt_var = gt_patches.var(dim=1, keepdim=True)
+    
+    texture_loss = F.l1_loss(rendered_var, gt_var)
+    loss_dict['texture'] = texture_loss.item()
+    
+    # 3. 高通滤波损失
+    high_pass_kernel = torch.tensor(
+        [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], 
+        dtype=torch.float32, device=device
+    ).view(1, 1, 3, 3) / 8.0
+    
+    rendered_high = F.conv2d(rendered_gray, high_pass_kernel, padding=1)
+    gt_high = F.conv2d(gt_gray, high_pass_kernel, padding=1)
+    
+    high_freq_loss = F.l1_loss(rendered_high, gt_high)
+    loss_dict['high_freq'] = high_freq_loss.item()
+    
+    # 组合损失
+    if opt is not None:
+        total_loss = (
+            edge_loss * opt.edge_loss_weight +
+            texture_loss * opt.texture_loss_weight +
+            high_freq_loss * opt.high_freq_loss_weight
+        )
+    else:
+        total_loss = edge_loss * 0.15 + texture_loss * 0.1 + high_freq_loss * 0.2
+    
+    loss_dict['total_high_freq'] = total_loss.item()
+    
+    return total_loss, loss_dict
+
+# ============================================================
+# 增强的渐进式损失函数
+# ============================================================
+def compute_progressive_loss_enhanced(image, gt_image, iteration, opt, 
+                                     wave_vectors=None, phase="low_freq"):
+    """
+    增强的渐进式损失函数，集成高频细节损失
+    """
+    
+    # 基础L1损失
+    l1 = l1_loss(image, gt_image)
+    
+    # SSIM损失
+    ssim_val = ssim(image.unsqueeze(0) if image.dim() == 3 else image,
+                    gt_image.unsqueeze(0) if gt_image.dim() == 3 else gt_image)
+    ssim_loss = 1.0 - ssim_val
+    
+    # 梯度损失（高频信息）
+    def compute_gradient_loss(img1, img2):
+        dx1 = img1[:, :, 1:] - img1[:, :, :-1]
+        dx2 = img2[:, :, 1:] - img2[:, :, :-1]
+        dy1 = img1[:, 1:, :] - img1[:, :-1, :]
+        dy2 = img2[:, 1:, :] - img2[:, :-1, :]
+        grad_loss = F.l1_loss(dx1, dx2) + F.l1_loss(dy1, dy2)
+        return grad_loss
+    
+    grad_loss = compute_gradient_loss(image, gt_image)
+    
+    # 获取动态权重
+    loss_weights = opt.get_loss_weights(iteration) if hasattr(opt, 'get_loss_weights') else None
+    
+    if loss_weights is None:
+        # 默认权重（向后兼容）
+        if phase == "low_freq":
+            w_l1, w_ssim, w_grad = 0.8, 0.2, 0.0
+        elif phase == "mid_freq":
+            progress = (iteration - 10000) / 15000
+            w_l1, w_ssim, w_grad = 0.6, 0.2, 0.2 * progress
+        else:
+            w_l1, w_ssim, w_grad = 0.4, 0.2, 0.4
+    else:
+        w_l1 = loss_weights.get('l1', 0.8)
+        w_ssim = loss_weights.get('ssim', 0.2)
+        w_grad = loss_weights.get('gradient', 0.1)
+    
+    # 计算基础损失
+    total_loss = w_l1 * l1 + w_ssim * ssim_loss + w_grad * grad_loss
+    
+    loss_dict = {
+        'total': total_loss.item(),
+        'l1': l1.item(),
+        'ssim': ssim_loss.item(),
+        'gradient': grad_loss.item(),
+        'phase': phase
+    }
+    
+    # 添加高频细节损失（如果启用）
+    if phase != "low_freq" and opt.enable_high_freq_enhancement:
+        high_freq_loss, hf_dict = compute_high_frequency_detail_loss(
+            image, gt_image, wave_vectors, opt
+        )
+        total_loss += high_freq_loss
+        loss_dict.update(hf_dict)
+    
+    # Wave正则化
+    if wave_vectors is not None and phase != "low_freq":
+        wave_norms = torch.norm(wave_vectors, dim=1)
+        wave_reg = wave_norms.mean() * opt.lambda_wave_reg
+        
+        # 防止wave爆炸
+        if wave_norms.max() > opt.max_wave_norm:
+            wave_reg += torch.relu(wave_norms - opt.max_wave_norm).mean() * 0.1
+        
+        total_loss += wave_reg
+        loss_dict['wave_reg'] = wave_reg.item()
+    
+    return total_loss, loss_dict
+
+# ============================================================
+# 原始的渐进式Wave初始化（保留兼容性）
+# ============================================================
+def initialize_wave_progressive(gaussians, iteration, opt=None):
+    """渐进式wave初始化（原始版本）"""
+    with torch.no_grad():
+        N = gaussians._xyz.shape[0]
+        device = gaussians._xyz.device
+        
+        # 基于梯度累积初始化
+        if hasattr(gaussians, 'xyz_gradient_accum') and gaussians.xyz_gradient_accum is not None:
+            grad_norms = torch.norm(gaussians.xyz_gradient_accum, dim=1)
+            grad_norms = grad_norms / (grad_norms.max() + 1e-8)
+            
+            # 高梯度区域给予更大的初始wave
+            wave_init = torch.randn(N, 3, device=device) * 0.1
+            wave_init *= (1.0 + grad_norms.unsqueeze(1) * 2.0)
+        else:
+            # 随机初始化
+            wave_init = torch.randn(N, 3, device=device) * 0.1
+        
+        gaussians._wave.data = wave_init
+        print(f"[Wave Init] Initialized {N} wave vectors at iteration {iteration}")
+
+# ============================================================
+# 渲染函数
+# ============================================================
+def render_optimized(viewpoint_camera, gaussians, pipe, bg, 
+                     iteration=0, max_iteration=40000, use_amp=False):
+    """优化的渲染函数"""
+    
+    # 设置分裂和wave状态
+    if hasattr(gaussians, 'use_splitting'):
+        use_split = gaussians.use_splitting
+    else:
+        use_split = False
+    
+    if hasattr(gaussians, 'use_wave'):
+        use_wave = gaussians.use_wave
+    else:
+        use_wave = False
+    
+    # 调用基础渲染
+    render_pkg = render(viewpoint_camera, gaussians, pipe, bg)
+    
+    return render_pkg
+
+# ============================================================
+# 准备输出和日志
+# ============================================================
+def prepare_output_and_logger(args):
+    if not args.model_path:
+        if os.getenv('OAR_JOB_ID'):
+            unique_str = os.getenv('OAR_JOB_ID')
+        else:
+            unique_str = str(uuid.uuid4())
+        args.model_path = os.path.join("./output/", unique_str[0:10])
+    
+    print(f"Output folder: {args.model_path}")
+    os.makedirs(args.model_path, exist_ok=True)
+    
+    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+    
+    tb_writer = None
+    if TENSORBOARD_FOUND:
+        tb_writer = SummaryWriter(args.model_path)
+    else:
+        print("Tensorboard not available: not logging progress")
+    
+    return tb_writer
+
+# ============================================================
+# 训练主函数
+# ============================================================
+def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_iterations, 
+                                checkpoint_iterations, checkpoint, debug_from):
+    """
+    增强的优化训练函数
+    集成高频细节优化功能
+    """
+    
+    first_iter = 0
+    tb_writer = prepare_output_and_logger(dataset)
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
+    
+    # 检查点加载
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+    
+    # 背景设置
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    
+    # 混合精度
+    use_amp = False  # 暂时禁用，确保稳定性
+    scaler = GradScaler(enabled=use_amp)
+    
+    # ========== 训练阶段定义 ==========
+    PHASE1_END = opt.phase1_end if hasattr(opt, 'phase1_end') else 10000
+    PHASE2_END = opt.phase2_end if hasattr(opt, 'phase2_end') else 25000
+    
+    # ========== 训练循环 ==========
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training")
+    
+    first_iter += 1
+    for iteration in range(first_iter, opt.iterations + 1):
+        progress_bar.update(1)
+        
+        iter_start.record()
+        
+        # ========== 确定训练阶段 ==========
+        if iteration <= PHASE1_END:
+            phase = "low_freq"
+            gaussians.use_wave = False
+            gaussians.use_splitting = False
+        elif iteration <= PHASE2_END:
+            phase = "mid_freq"
+            gaussians.use_wave = True
+            gaussians.use_splitting = False
+            # 在阶段2开始时初始化wave
+            if iteration == PHASE1_END + 1:
+                print("\n" + "="*50)
+                print(f"[Phase 2] Starting at iteration {iteration}")
+                print("="*50)
+                if opt.gradient_based_wave_init and opt.enable_high_freq_enhancement:
+                    # 使用基于梯度的智能初始化
+                    initialize_wave_by_image_gradient(gaussians, scene, opt, pipe, white_background=dataset.white_background)
+                else:
+                    # 使用原始的渐进式初始化
+                    initialize_wave_progressive(gaussians, iteration, opt)
+                torch.cuda.empty_cache()
+        else:
+            phase = "high_freq"
+            gaussians.use_wave = True
+            gaussians.use_splitting = opt.use_splitting
+            if iteration == PHASE2_END + 1:
+                print("\n" + "="*50)
+                print(f"[Phase 3] Starting at iteration {iteration}")
+                print("="*50)
+                torch.cuda.empty_cache()
+        
+        # ========== 学习率调度 ==========
+        gaussians.update_learning_rate(iteration)
+        
+        # Wave学习率调度（阶段2和3）
+        if phase != "low_freq":
+            for param_group in gaussians.optimizer.param_groups:
+                if param_group["name"] == "wave":
+                    if phase == "mid_freq":
+                        base_lr = opt.wave_lr * 0.5
+                    else:
+                        base_lr = opt.wave_lr
+                    
+                    # Cosine衰减
+                    progress = (iteration - PHASE1_END) / (opt.iterations - PHASE1_END)
+                    lr = base_lr * (0.5 * (1 + np.cos(np.pi * progress)))
+                    param_group['lr'] = lr
+        
+        # SH degree增加
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+        
+        # ========== 选择相机 ==========
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        
+        # ========== 渲染 ==========
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+        
+        # 修复autocast使用方式
+        with autocast(enabled=use_amp):
+            render_pkg = render_optimized(
+                viewpoint_cam, gaussians, pipe, background,
+                iteration=iteration,
+                max_iteration=opt.iterations,
+                use_amp=use_amp
+            )
+            
+            image = render_pkg["render"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+        
+        # ========== 计算损失 ==========
+        gt_image = viewpoint_cam.original_image.cuda()
+        
+        # 使用增强的渐进式损失函数
+        wave_vectors = gaussians._wave if hasattr(gaussians, '_wave') and phase != "low_freq" else None
+        
+        loss, loss_dict = compute_progressive_loss_enhanced(
+            image, gt_image, 
+            iteration=iteration,
+            opt=opt,
+            wave_vectors=wave_vectors,
+            phase=phase
+        )
+        
+        # ========== 反向传播 ==========
+        loss.backward()
+        iter_end.record()
+        
+        with torch.no_grad():
+            # ========== 梯度裁剪 ==========
+            if phase != "low_freq" and hasattr(gaussians, '_wave'):
+                if gaussians._wave.grad is not None:
+                    grad_norm = gaussians._wave.grad.norm()
+                    if grad_norm > 1.0:
+                        gaussians._wave.grad *= 1.0 / grad_norm
+            
+            # ========== 更新进度条 ==========
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                postfix_dict = {
+                    "Loss": f"{ema_loss_for_log:.4f}",
+                    "Phase": phase,
+                    "Points": f"{gaussians._xyz.shape[0]:,}"
+                }
+                # 添加高频损失信息（如果有）
+                if 'total_high_freq' in loss_dict:
+                    postfix_dict["HF"] = f"{loss_dict['total_high_freq']:.4f}"
+                progress_bar.set_postfix(postfix_dict)
+            
+            # ========== 密集化 ==========
+            if iteration < opt.densify_until_iter:
+                # 记录梯度统计
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter],
+                    radii[visibility_filter]
+                )
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                
+                # 执行密集化
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    
+                    # 检查是否有高频感知密集化方法
+                    if hasattr(gaussians, 'densify_and_prune_high_freq_aware') and opt.adaptive_densification:
+                        # 使用高频感知密集化
+                        gaussians.densify_and_prune_high_freq_aware(
+                            opt.densify_grad_threshold, 0.005,
+                            scene.cameras_extent, size_threshold,
+                            iteration, opt
+                        )
+                    else:
+                        # 使用标准密集化
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold, 0.005,
+                            scene.cameras_extent, size_threshold
+                        )
+                
+                # 重置不透明度
+                if iteration % opt.opacity_reset_interval == 0 or \
+                   (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
+            
+            # ========== 优化器步进 ==========
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+            
+            # ========== 检查点保存 ==========
+            if iteration in checkpoint_iterations:
+                print(f"\n[ITER {iteration}] Saving Checkpoint")
+                torch.save((gaussians.capture(), iteration), 
+                          scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            
+            # ========== 定期保存 ==========
+            if iteration in saving_iterations:
+                print(f"\n[ITER {iteration}] Saving Gaussians")
+                safe_state(iteration > opt.iterations)
+                gaussians.save_ply(os.path.join(scene.model_path, 
+                                                f"point_cloud/iteration_{iteration}/point_cloud.ply"))
+            
+            # ========== 内存管理 ==========
+            if iteration % 1000 == 0:
+                torch.cuda.empty_cache()
+                
+                # 打印统计信息
+                if opt.verbose_split_stats and phase != "low_freq":
+                    wave_norms = torch.norm(gaussians._wave, dim=1) if hasattr(gaussians, '_wave') else None
+                    if wave_norms is not None:
+                        print(f"\n[Stats] Iteration {iteration}:")
+                        print(f"  Gaussians: {gaussians._xyz.shape[0]}")
+                        print(f"  Active waves: {(wave_norms > 0.01).sum().item()}")
+                        print(f"  Mean wave norm: {wave_norms.mean().item():.4f}")
+                        print(f"  Max wave norm: {wave_norms.max().item():.4f}")
+            
+            # ========== TensorBoard记录 ==========
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/total', ema_loss_for_log, iteration)
+                tb_writer.add_scalar('train_loss_patches/l1', loss_dict['l1'], iteration)
+                tb_writer.add_scalar('train_loss_patches/ssim', loss_dict['ssim'], iteration)
+                if 'total_high_freq' in loss_dict:
+                    tb_writer.add_scalar('train_loss_patches/high_freq', loss_dict['total_high_freq'], iteration)
+                tb_writer.add_scalar('total_points', gaussians._xyz.shape[0], iteration)
+                tb_writer.add_scalar('phase', {"low_freq": 0, "mid_freq": 1, "high_freq": 2}[phase], iteration)
+    
+    print("\n" + "="*50)
+    print("Training complete!")
+    print(f"Final loss: {ema_loss_for_log:.4f}")
+    print(f"Total Gaussians: {gaussians._xyz.shape[0]}")
+    print("="*50)
+
+# ============================================================
+# 主函数入口
+# ============================================================
+if __name__ == "__main__":
+    # 解析参数
+    parser = ArgumentParser(description="Training script parameters")
+    lp = ModelParams(parser)
+    op = OptimizationParams(parser)
+    pp = PipelineParams(parser)
+    parser.add_argument('--ip', type=str, default="127.0.0.1")
+    parser.add_argument('--port', type=int, default=6009)
+    parser.add_argument('--debug_from', type=int, default=-1)
+    parser.add_argument('--detect_anomaly', action='store_true', default=False)
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    args = parser.parse_args(sys.argv[1:])
+    args.save_iterations.append(args.iterations)
+    
+    print("Optimizing " + args.model_path)
+    
+    # 初始化系统
+    safe_state(args.quiet)
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    
+    # 启动训练
+    training_optimized_enhanced(
+        lp.extract(args), op.extract(args), pp.extract(args),
+        args.test_iterations, args.save_iterations,
+        args.checkpoint_iterations, args.start_checkpoint, args.debug_from
+    )
+    
+    # 完成
+    print("\nTraining complete!")

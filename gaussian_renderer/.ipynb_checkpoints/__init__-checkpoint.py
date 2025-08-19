@@ -1,0 +1,772 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
+import torch
+import math
+import numpy as np
+import time
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from scene.gaussian_model import GaussianModel
+from scene.laplacian_model import LaplacianModel
+from scene.new_model import SplitLaplacianModel, SplitGaussianModel
+from utils.sh_utils import eval_sh
+from utils.general_utils import build_rotation
+
+def quaternion_multiply(q1, q2):
+    """
+    四元数乘法
+    q1, q2: [N, 4] tensors representing quaternions [w, x, y, z]
+    """
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return torch.stack([w, x, y, z], dim=1)
+
+def build_rotation_from_axis_to_axis(from_axis, to_axis):
+    """
+    构建将from_axis旋转到to_axis的四元数
+    
+    Args:
+        from_axis: [N, 3] 起始轴（归一化）
+        to_axis: [N, 3] 目标轴（归一化）
+    
+    Returns:
+        quaternion: [N, 4] 四元数 [w, x, y, z]
+    """
+    N = from_axis.shape[0]
+    device = from_axis.device
+    
+    # 归一化
+    from_axis = from_axis / (torch.norm(from_axis, dim=1, keepdim=True) + 1e-8)
+    to_axis = to_axis / (torch.norm(to_axis, dim=1, keepdim=True) + 1e-8)
+    
+    # 计算旋转轴（叉积）
+    rotation_axis = torch.cross(from_axis, to_axis, dim=1)
+    axis_norm = torch.norm(rotation_axis, dim=1, keepdim=True)
+    
+    # 计算旋转角度（点积）
+    cos_angle = torch.sum(from_axis * to_axis, dim=1, keepdim=True)
+    cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+    
+    # 处理平行和反平行的情况
+    parallel_mask = (axis_norm.squeeze() < 1e-6)
+    antiparallel_mask = parallel_mask & (cos_angle.squeeze() < 0)
+    
+    # 默认四元数（单位四元数，无旋转）
+    quaternion = torch.zeros((N, 4), device=device)
+    quaternion[:, 0] = 1.0  # w = 1
+    
+    # 对于需要旋转的情况
+    valid_mask = ~parallel_mask
+    if valid_mask.any():
+        # 归一化旋转轴
+        rotation_axis[valid_mask] = rotation_axis[valid_mask] / (axis_norm[valid_mask] + 1e-8)
+        
+        # 使用Rodrigues公式的四元数形式
+        # q = [cos(θ/2), sin(θ/2) * axis]
+        angle = torch.acos(cos_angle[valid_mask])
+        half_angle = angle / 2.0
+        
+        quaternion[valid_mask, 0] = torch.cos(half_angle).squeeze()  # w
+        sin_half = torch.sin(half_angle)
+        quaternion[valid_mask, 1:] = rotation_axis[valid_mask] * sin_half
+    
+    # 处理反平行情况（180度旋转）
+    if antiparallel_mask.any():
+        # 找一个垂直轴
+        # 如果from_axis接近z轴，使用x轴；否则使用z轴
+        z_axis = torch.tensor([0, 0, 1], device=device, dtype=from_axis.dtype)
+        x_axis = torch.tensor([1, 0, 0], device=device, dtype=from_axis.dtype)
+        
+        z_dot = torch.abs(torch.sum(from_axis[antiparallel_mask] * z_axis, dim=1))
+        use_x = z_dot > 0.9
+        
+        perp_axis = torch.zeros_like(from_axis[antiparallel_mask])
+        perp_axis[use_x] = x_axis
+        perp_axis[~use_x] = z_axis
+        
+        # 计算垂直轴
+        perp_axis = torch.cross(from_axis[antiparallel_mask], perp_axis, dim=1)
+        perp_axis = perp_axis / (torch.norm(perp_axis, dim=1, keepdim=True) + 1e-8)
+        
+        # 180度旋转的四元数：q = [0, axis]
+        quaternion[antiparallel_mask, 0] = 0.0
+        quaternion[antiparallel_mask, 1:] = perp_axis
+    
+    # 归一化四元数
+    quaternion = quaternion / (torch.norm(quaternion, dim=1, keepdim=True) + 1e-8)
+    
+    return quaternion
+
+def vectorized_compute_splits_continuous_improved(pc, max_splits_global=10, progress=0.0):
+    """
+    改进的连续分裂计算，使用批量处理优化内存使用
+    修复了features_dc和features_rest的维度问题
+    """
+    # 获取高斯参数
+    xyz = pc.get_xyz
+    opacity = pc.get_opacity
+    scaling = pc.get_scaling
+    rotation = pc.get_rotation
+    features_dc = pc._features_dc
+    features_rest = pc._features_rest
+    
+    # 获取wave参数
+    if hasattr(pc, 'get_wave'):
+        wave = pc.get_wave
+    elif hasattr(pc, '_wave'):
+        wave = pc._wave
+    else:
+        # 如果没有wave参数，不进行分裂
+        return None
+    
+    N = xyz.shape[0]
+    device = xyz.device
+    epsilon = 1e-8
+    
+    # 计算wave的模长
+    wave_norms = torch.norm(wave, dim=1)
+    
+    # 特殊处理：wave全为0的情况
+    zero_wave_mask = wave_norms < epsilon
+    if zero_wave_mask.all():
+        # 所有wave都是0，返回原始高斯（不分裂但保持梯度连接）
+        return {
+            'split_xyz': xyz.clone(),
+            'split_opacity': opacity.clone(),
+            'split_scaling': scaling.clone(),
+            'split_rotation': rotation.clone(),
+            'split_features_dc': features_dc.clone(),
+            'split_features_rest': features_rest.clone(),
+            'n_splits': N,
+            'n_original': N,
+            'original_indices': torch.arange(N, device=device),
+            'split_distribution': {0: N},
+        }
+    
+    # 根据进度调整分裂强度
+    split_strength = min(1.0, progress * 2.0)  # 前50%训练逐渐增强
+    
+    # 计算每个高斯需要的分裂数k
+    # 使用更平滑的阈值，添加最小阈值
+    min_threshold = 0.05  # 最小阈值，低于此值不分裂
+    thresholds = torch.tensor([min_threshold, 0.5, 1.0, 2.0], device=device) * split_strength
+    k_values = torch.zeros(N, dtype=torch.long, device=device)
+    
+    # 只对wave_norm大于最小阈值的高斯进行分裂
+    for i, thresh in enumerate(thresholds):
+        k_values[(wave_norms > thresh) & (wave_norms > min_threshold)] = i + 1
+    
+    # 对于wave接近0的高斯，始终设置k=0（不分裂）
+    k_values[zero_wave_mask] = 0
+    
+    # 限制最大分裂数
+    k_values = torch.minimum(k_values, torch.tensor(max_splits_global, device=device))
+    
+    # 如果没有需要分裂的高斯，返回None
+    if k_values.max() == 0:
+        return None
+    
+    # 统计分裂分布
+    split_distribution = {}
+    for k in range(0, k_values.max().item() + 1):
+        count = (k_values == k).sum().item()
+        if count > 0:
+            split_distribution[k] = count
+    
+    # 预分配输出张量 - 修复：正确处理features的维度
+    total_splits = (2 * k_values + 1).sum().item()
+    
+    split_xyz = torch.zeros((total_splits, 3), device=device)
+    split_opacity = torch.zeros((total_splits, 1), device=device)
+    split_scaling = torch.zeros((total_splits, 3), device=device)
+    split_rotation = torch.zeros((total_splits, 4), device=device)
+    
+    # 修复：features_dc和features_rest是3维张量
+    if features_dc.dim() == 3:
+        split_features_dc = torch.zeros((total_splits, features_dc.shape[1], features_dc.shape[2]), device=device)
+    else:
+        split_features_dc = torch.zeros((total_splits, features_dc.shape[1]), device=device)
+    
+    if features_rest.dim() == 3:
+        split_features_rest = torch.zeros((total_splits, features_rest.shape[1], features_rest.shape[2]), device=device)
+    else:
+        split_features_rest = torch.zeros((total_splits, features_rest.shape[1]), device=device)
+    
+    original_indices = []
+    current_idx = 0
+    
+    # 批处理分裂计算
+    for k in range(0, k_values.max().item() + 1):
+        mask = (k_values == k)
+        if not mask.any():
+            continue
+        
+        indices = torch.where(mask)[0]
+        n_gaussians = indices.shape[0]
+        
+        # 内存优化：限制每批处理的数量
+        max_batch_size = 5000
+        for batch_start in range(0, n_gaussians, max_batch_size):
+            batch_end = min(batch_start + max_batch_size, n_gaussians)
+            batch_indices = indices[batch_start:batch_end]
+            batch_size = batch_indices.shape[0]
+            
+            n_splits_per = 2 * k + 1
+            n_total = batch_size * n_splits_per
+            
+            if k == 0:
+                # 不分裂的高斯，直接复制
+                end_idx = current_idx + n_total
+                split_xyz[current_idx:end_idx] = xyz[batch_indices]
+                split_opacity[current_idx:end_idx] = opacity[batch_indices]
+                split_scaling[current_idx:end_idx] = scaling[batch_indices]
+                split_rotation[current_idx:end_idx] = rotation[batch_indices]
+                
+                # 修复：正确处理3维features
+                if features_dc.dim() == 3:
+                    split_features_dc[current_idx:end_idx] = features_dc[batch_indices]
+                else:
+                    split_features_dc[current_idx:end_idx] = features_dc[batch_indices]
+                    
+                if features_rest.dim() == 3:
+                    split_features_rest[current_idx:end_idx] = features_rest[batch_indices]
+                else:
+                    split_features_rest[current_idx:end_idx] = features_rest[batch_indices]
+                
+                original_indices.extend(batch_indices.tolist())
+            else:
+                # 批量计算分裂
+                batch_xyz = xyz[batch_indices]
+                batch_opacity = opacity[batch_indices]
+                batch_scaling = scaling[batch_indices]
+                batch_rotation = rotation[batch_indices]
+                batch_features_dc = features_dc[batch_indices]
+                batch_features_rest = features_rest[batch_indices]
+                batch_wave = wave[batch_indices]
+                
+                # 归一化wave方向
+                batch_wave_norms = torch.norm(batch_wave, dim=1, keepdim=True)
+                wave_dir = batch_wave / (batch_wave_norms + epsilon)
+                
+                # 获取主轴方向（最大scale对应的方向）
+                max_scale_idx = torch.argmax(batch_scaling, dim=1)
+                
+                # 从四元数获取旋转矩阵的主轴
+                from utils.general_utils import build_rotation
+                R = build_rotation(batch_rotation)
+                main_axis = torch.zeros_like(batch_xyz)
+                for i in range(3):
+                    mask_axis = (max_scale_idx == i)
+                    if mask_axis.any():
+                        main_axis[mask_axis] = R[mask_axis, :, i]
+                
+                # 计算沿wave方向的尺度 - 关键修复
+                main_scale_values = batch_scaling.gather(1, max_scale_idx.unsqueeze(1))
+                main_scale = main_scale_values.squeeze(1)  # 确保是一维 [batch_size]
+                
+                # 生成分裂位置
+                for j in range(-k, k+1):
+                    # 修复：确保offset具有正确的形状
+                    offset = j * 0.5 * main_scale.unsqueeze(1) * wave_dir  # [batch_size, 3]
+                    
+                    idx_start = current_idx + (j + k) * batch_size
+                    idx_end = idx_start + batch_size
+                    
+                    # 现在offset已经是正确的形状，直接使用
+                    split_xyz[idx_start:idx_end] = batch_xyz + offset
+                    
+                    # 调整不透明度和尺度（基于高斯权重）
+                    if j == 0:
+                        # 中心高斯
+                        alpha = 0.6
+                        scale_factor = 0.8
+                    else:
+                        # 周围高斯，根据距离调整权重
+                        distance_factor = abs(j) / k
+                        gaussian_weight = torch.exp(-0.5 * (distance_factor * 2) ** 2)
+                        alpha = 0.3 * gaussian_weight / k
+                        scale_factor = 0.6 * (1 - 0.2 * distance_factor)
+                    
+                    split_opacity[idx_start:idx_end] = batch_opacity * alpha
+                    split_scaling[idx_start:idx_end] = batch_scaling * scale_factor
+                    split_rotation[idx_start:idx_end] = batch_rotation
+                    
+                    # 修复：正确处理3维features
+                    if features_dc.dim() == 3:
+                        split_features_dc[idx_start:idx_end] = batch_features_dc
+                    else:
+                        split_features_dc[idx_start:idx_end] = batch_features_dc
+                        
+                    if features_rest.dim() == 3:
+                        split_features_rest[idx_start:idx_end] = batch_features_rest
+                    else:
+                        split_features_rest[idx_start:idx_end] = batch_features_rest
+                
+                # 记录原始索引
+                base_indices = batch_indices.unsqueeze(1).expand(-1, n_splits_per).flatten()
+                original_indices.extend(base_indices.tolist())
+            
+            current_idx += n_total
+    
+    # 截断到实际使用的大小
+    split_xyz = split_xyz[:current_idx]
+    split_opacity = split_opacity[:current_idx]
+    split_scaling = split_scaling[:current_idx]
+    split_rotation = split_rotation[:current_idx]
+    split_features_dc = split_features_dc[:current_idx]
+    split_features_rest = split_features_rest[:current_idx]
+
+    original_indices = torch.tensor(original_indices, device=device, dtype=torch.long)
+    
+    # 批量能量归一化（优化内存使用）
+    unique_indices = torch.unique(original_indices)
+    
+    # 分批处理以避免内存峰值
+    batch_size = min(10000, unique_indices.shape[0])
+    
+    for batch_start in range(0, unique_indices.shape[0], batch_size):
+        batch_end = min(batch_start + batch_size, unique_indices.shape[0])
+        batch_unique = unique_indices[batch_start:batch_end]
+        
+        # 为当前批次创建mask
+        batch_mask = torch.zeros(current_idx, dtype=torch.bool, device=device)
+        for idx in batch_unique:
+            batch_mask |= (original_indices == idx)
+        
+        if batch_mask.any():
+            # 获取这批原始高斯的目标不透明度
+            batch_original_indices = original_indices[batch_mask]
+            target_opacities = opacity[batch_original_indices]
+            
+            # 计算每个原始高斯的总不透明度
+            total_opacity_per_original = torch.zeros(N, 1, device=device)
+            total_opacity_per_original.scatter_add_(0, batch_original_indices.unsqueeze(1), 
+                                                   split_opacity[batch_mask])
+            
+            # 计算归一化因子
+            current_totals = total_opacity_per_original[batch_original_indices]
+            normalization_factors = target_opacities / (current_totals + epsilon)
+            
+            # 应用归一化
+            split_opacity[batch_mask] *= normalization_factors
+    
+    # 清理中间变量以释放内存
+    del k_values, wave_norms
+    if 'batch_mask' in locals():
+        del batch_mask
+    if 'batch_xyz' in locals():
+        del batch_xyz, batch_opacity, batch_scaling, batch_rotation
+        del batch_features_dc, batch_features_rest, batch_wave
+    torch.cuda.empty_cache()
+    
+    return {
+        'split_xyz': split_xyz,
+        'split_opacity': split_opacity,
+        'split_scaling': split_scaling,
+        'split_rotation': split_rotation,
+        'split_features_dc': split_features_dc,
+        'split_features_rest': split_features_rest,
+        'n_splits': current_idx,
+        'n_original': N,
+        'original_indices': original_indices,
+        'split_distribution': split_distribution,
+    }
+
+# 提供向后兼容的别名
+vectorized_compute_splits_continuous = vectorized_compute_splits_continuous_improved
+def vectorized_compute_splits_continuous_improved_with_debug(pc, max_splits_global=10, progress=0.0, debug=False):
+    """
+    带调试功能的分裂计算
+    """
+    if debug:
+        debug_tensor_shapes(pc, "Before splitting")
+    
+    # ... 原始的分裂计算代码 ...
+    result = vectorized_compute_splits_continuous_improved(pc, max_splits_global, progress)
+    
+    if debug and result is not None:
+        validate_split_data(result, pc)
+    
+    return result
+
+
+def debug_tensor_shapes(pc, location=""):
+    """
+    打印所有相关张量的形状，用于调试
+    
+    Args:
+        pc: GaussianModel对象
+        location: 调用位置标识
+    """
+    print(f"\n{'='*50}")
+    print(f"Debug Tensor Shapes at {location}")
+    print(f"{'='*50}")
+    
+    print(f"xyz shape: {pc.get_xyz.shape}")
+    print(f"opacity shape: {pc.get_opacity.shape}")
+    print(f"scaling shape: {pc.get_scaling.shape}")
+    print(f"rotation shape: {pc.get_rotation.shape}")
+    
+    # Features可能是3维的
+    print(f"features_dc shape: {pc._features_dc.shape}")
+    print(f"features_dc dim: {pc._features_dc.dim()}")
+    print(f"features_rest shape: {pc._features_rest.shape}")
+    print(f"features_rest dim: {pc._features_rest.dim()}")
+    
+    if hasattr(pc, '_wave'):
+        print(f"wave shape: {pc._wave.shape}")
+        wave_norms = torch.norm(pc._wave, dim=1)
+        print(f"wave norms - mean: {wave_norms.mean():.4f}, max: {wave_norms.max():.4f}, min: {wave_norms.min():.4f}")
+        print(f"wave active (>0.01): {(wave_norms > 0.01).sum().item()}/{wave_norms.shape[0]}")
+    
+    print(f"{'='*50}\n")
+def validate_split_data(split_data, pc):
+    """
+    验证分裂数据的一致性
+    
+    Args:
+        split_data: 分裂计算返回的字典
+        pc: 原始GaussianModel对象
+    """
+    if split_data is None:
+        print("Split data is None")
+        return False
+    
+    errors = []
+    
+    # 检查必要的键
+    required_keys = ['split_xyz', 'split_opacity', 'split_scaling', 'split_rotation', 
+                     'split_features_dc', 'split_features_rest', 'n_splits', 'n_original', 
+                     'original_indices']
+    
+    for key in required_keys:
+        if key not in split_data:
+            errors.append(f"Missing key: {key}")
+    
+    if errors:
+        print("Validation errors:")
+        for error in errors:
+            print(f"  - {error}")
+        return False
+    
+    # 检查维度一致性
+    n_splits = split_data['n_splits']
+    
+    # 检查每个张量的第一维是否一致
+    tensors_to_check = {
+        'split_xyz': (n_splits, 3),
+        'split_opacity': (n_splits, 1),
+        'split_scaling': (n_splits, 3),
+        'split_rotation': (n_splits, 4),
+    }
+    
+    for name, expected_shape in tensors_to_check.items():
+        actual_shape = split_data[name].shape
+        if actual_shape[0] != expected_shape[0]:
+            errors.append(f"{name}: expected first dim {expected_shape[0]}, got {actual_shape[0]}")
+        if len(actual_shape) != len(expected_shape):
+            errors.append(f"{name}: expected {len(expected_shape)} dims, got {len(actual_shape)}")
+    
+    # 特殊处理features（可能是3维）
+    if pc._features_dc.dim() == 3:
+        expected_shape = (n_splits, pc._features_dc.shape[1], pc._features_dc.shape[2])
+        actual_shape = split_data['split_features_dc'].shape
+        if actual_shape != expected_shape:
+            errors.append(f"split_features_dc: expected shape {expected_shape}, got {actual_shape}")
+    
+    if pc._features_rest.dim() == 3:
+        expected_shape = (n_splits, pc._features_rest.shape[1], pc._features_rest.shape[2])
+        actual_shape = split_data['split_features_rest'].shape
+        if actual_shape != expected_shape:
+            errors.append(f"split_features_rest: expected shape {expected_shape}, got {actual_shape}")
+    
+    # 检查原始索引
+    if split_data['original_indices'].shape[0] != n_splits:
+        errors.append(f"original_indices length mismatch: {split_data['original_indices'].shape[0]} != {n_splits}")
+    
+    if errors:
+        print("Validation errors:")
+        for error in errors:
+            print(f"  - {error}")
+        return False
+    
+    print(f"Split data validation passed: {n_splits} splits from {split_data['n_original']} original gaussians")
+    return True
+
+# 保留原始的render函数主体结构，只替换分裂计算部分
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, iteration=0, max_iteration=40000):
+    """
+    Render the scene with improved continuous splitting.
+    
+    Background tensor (bg_color) must be on GPU!
+    """
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    opacity = pc.get_opacity
+    n_original = means3D.shape[0]
+
+    # 初始化变量
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    colors_precomp = None
+    shs = None
+
+    # Get pre-computed 3D covariance (if provided)
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling
+        rotations = pc.get_rotation
+
+    # Apply splitting if enabled
+    use_splitting = False
+    if hasattr(pc, 'use_splitting'):
+        use_splitting = pc.use_splitting
+    elif isinstance(pc, (SplitGaussianModel, SplitLaplacianModel)):
+        use_splitting = True
+    
+    split_data = None
+    
+    if use_splitting and iteration > 0:
+        # 使用改进的分裂计算
+        progress = min(iteration / max_iteration, 1.0)
+        max_splits = pc._max_splits if hasattr(pc, '_max_splits') else 10
+        
+        # 使用缓存机制（如果有）
+        if hasattr(pc, 'get_split_data'):
+            split_data = pc.get_split_data(iteration, max_iteration)
+        else:
+            split_data = vectorized_compute_splits_continuous_improved(pc, max_splits_global=max_splits, progress=progress)
+        
+        if split_data is not None:
+            # 只在关键迭代打印信息
+            if iteration % 500 == 0:
+                print(f"[Iter {iteration}] Original: {n_original}, Split: {split_data['split_xyz'].shape[0]}")
+            
+            # 使用分裂的高斯替换原始高斯
+            means3D = split_data['split_xyz']
+            opacity = split_data['split_opacity']
+            
+            # 扩展means2D
+            extended_means2D = torch.zeros((means3D.shape[0], 3), dtype=means2D.dtype, device=means2D.device, requires_grad=True)
+            try:
+                extended_means2D.retain_grad()
+            except:
+                pass
+            means2D = extended_means2D
+            
+            # 处理其他属性
+            if pipe.compute_cov3D_python:
+                from utils.general_utils import build_scaling_rotation, strip_symmetric
+                scales_modified = scaling_modifier * split_data['split_scaling']
+                L = build_scaling_rotation(scales_modified, split_data['split_rotation'])
+                actual_covariance = torch.bmm(L, L.transpose(1, 2))
+                cov3D_precomp = strip_symmetric(actual_covariance)
+                scales = None
+                rotations = None
+            else:
+                scales = split_data['split_scaling']
+                rotations = split_data['split_rotation']
+            
+            # 处理颜色（使用分裂后的特征）
+            if override_color is not None:
+                colors_precomp = override_color.unsqueeze(0).expand(means3D.shape[0], -1)
+                shs = None
+            elif pipe.convert_SHs_python:
+                shs_view = torch.cat([split_data['split_features_dc'], 
+                                     split_data['split_features_rest']], dim=1)
+                shs_view = shs_view.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+                dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
+                dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+                sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+                colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+                shs = None
+            else:
+                shs = torch.cat([split_data['split_features_dc'], 
+                               split_data['split_features_rest']], dim=1)
+                colors_precomp = None
+    else:
+        # 不使用分裂
+        split_data = None
+        
+        # 正常处理协方差
+        if not pipe.compute_cov3D_python:
+            scales = pc.get_scaling
+            rotations = pc.get_rotation
+            cov3D_precomp = None
+        else:
+            cov3D_precomp = pc.get_covariance(scaling_modifier)
+            scales = None
+            rotations = None
+        
+        # 处理颜色
+        if override_color is not None:
+            colors_precomp = override_color
+            shs = None
+        elif pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            shs = None
+        else:
+            shs = pc.get_features
+            colors_precomp = None
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    # 检查参数有效性
+    assert (shs is None) != (colors_precomp is None), \
+        f"Must provide exactly one of shs or colors_precomp. shs={shs is not None}, colors_precomp={colors_precomp is not None}"
+    
+    # 根据参数调用rasterizer
+    rendered_image, radii = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = colors_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {
+        "render": rendered_image,
+        "viewspace_points": means2D if split_data is None else screenspace_points,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "split_viewspace_points": means2D if split_data is not None else None,
+        "split_info": {"n_original": n_original, "original_indices": split_data['original_indices']} if split_data is not None else None,
+        "split_data": split_data
+    }
+
+# 保留其他必要的函数
+def render_laplacian(viewpoint_camera, pc, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+    """
+    Render the scene for Laplacian model.
+    """
+    # Implementation for Laplacian model
+    pass
+
+def render_new(viewpoint_camera, pc, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+    """
+    Render the scene for new model.
+    """
+    # Implementation for new model
+    pass
+
+def export_splits_to_standard_gaussians(pc, iteration=0, max_iteration=40000, max_splits_global=None, progress=None):
+    """
+    将带wave参数的高斯模型转换为标准高斯模型
+    
+    Args:
+        pc: 带wave参数的SplitGaussianModel或SplitLaplacianModel
+        iteration: 当前迭代次数
+        max_iteration: 最大迭代次数
+        max_splits_global: 全局最大分裂数
+        progress: 训练进度
+    
+    Returns:
+        标准的GaussianModel对象，包含所有分裂后的高斯
+    """
+    from scene.gaussian_model import GaussianModel
+    import torch.nn as nn
+    
+    # 计算进度
+    if progress is None:
+        progress = min(iteration / max_iteration, 1.0) if max_iteration > 0 else 0.0
+    
+    # 使用默认的最大分裂数
+    if max_splits_global is None:
+        max_splits_global = pc._max_splits if hasattr(pc, '_max_splits') else 10
+    
+    # 获取分裂数据
+    if hasattr(pc, 'get_split_data'):
+        split_data = pc.get_split_data(iteration, max_iteration, max_splits_global, progress)
+    else:
+        split_data = vectorized_compute_splits_continuous(pc, max_splits_global, progress)
+    
+    # 创建标准高斯模型
+    standard_gaussians = GaussianModel(pc.max_sh_degree)
+    
+    if split_data is not None:
+        # 使用分裂后的参数
+        print(f"[Export] Converting {pc._xyz.shape[0]} gaussians to {split_data['split_xyz'].shape[0]} split gaussians")
+        
+        standard_gaussians._xyz = nn.Parameter(split_data['split_xyz'].clone())
+        standard_gaussians._features_dc = nn.Parameter(split_data['split_features_dc'].clone())
+        standard_gaussians._features_rest = nn.Parameter(split_data['split_features_rest'].clone())
+        standard_gaussians._opacity = nn.Parameter(split_data['split_opacity'].clone())
+        standard_gaussians._scaling = nn.Parameter(split_data['split_scaling'].clone())
+        standard_gaussians._rotation = nn.Parameter(split_data['split_rotation'].clone())
+        
+        # 初始化其他必要的属性
+        standard_gaussians.active_sh_degree = pc.active_sh_degree
+        standard_gaussians.max_radii2D = torch.zeros((split_data['split_xyz'].shape[0]), device='cuda')
+        standard_gaussians.xyz_gradient_accum = torch.zeros((split_data['split_xyz'].shape[0], 1), device='cuda')
+        standard_gaussians.denom = torch.zeros((split_data['split_xyz'].shape[0], 1), device='cuda')
+        standard_gaussians.spatial_lr_scale = pc.spatial_lr_scale
+    else:
+        # 如果没有分裂，直接复制原始参数
+        print(f"[Export] No splitting needed, copying {pc._xyz.shape[0]} gaussians directly")
+        
+        standard_gaussians._xyz = nn.Parameter(pc._xyz.clone())
+        standard_gaussians._features_dc = nn.Parameter(pc._features_dc.clone())
+        standard_gaussians._features_rest = nn.Parameter(pc._features_rest.clone())
+        standard_gaussians._opacity = nn.Parameter(pc._opacity.clone())
+        standard_gaussians._scaling = nn.Parameter(pc._scaling.clone())
+        standard_gaussians._rotation = nn.Parameter(pc._rotation.clone())
+        
+        # 复制其他属性
+        standard_gaussians.active_sh_degree = pc.active_sh_degree
+        standard_gaussians.max_radii2D = pc.max_radii2D.clone() if hasattr(pc, 'max_radii2D') else torch.zeros((pc._xyz.shape[0]), device='cuda')
+        standard_gaussians.xyz_gradient_accum = pc.xyz_gradient_accum.clone() if hasattr(pc, 'xyz_gradient_accum') else torch.zeros((pc._xyz.shape[0], 1), device='cuda')
+        standard_gaussians.denom = pc.denom.clone() if hasattr(pc, 'denom') else torch.zeros((pc._xyz.shape[0], 1), device='cuda')
+        standard_gaussians.spatial_lr_scale = pc.spatial_lr_scale if hasattr(pc, 'spatial_lr_scale') else 0.0
+    
+    return standard_gaussians
