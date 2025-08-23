@@ -15,7 +15,7 @@ class SplitConfig:
     split_factor: float = 1.6
     wave_lr: float = 0.01
     wave_init_noise: float = 0.01  # 重要：不能为0
-    wave_threshold: float = 0.01
+    wave_threshold: float = 1e-4
     
     # 训练阶段控制
     phase1_end: int = 10000
@@ -28,12 +28,30 @@ class SplitConfig:
     densify_grad_threshold: float = 0.0002
     densification_interval: int = 100
     densify_from_iter: int = 500
-    densify_until_iter: int = 35000
+    densify_until_iter: int = 15000
     opacity_reset_interval: int = 3000
     
     # 调试选项
     verbose: bool = True
     debug_interval: int = 100
+
+    # 速度/精度平衡（新增）
+    split_compute_interval: int = 5  # 分裂结果缓存迭代间隔
+    split_fast_align: bool = True    # 快速对齐：复用原rotation，仅沿最接近主轴方向更新scale
+    split_newton_steps: int = 1      # 牛顿步数（1步足够稳定，显著降开销）
+    split_t_sigma_range: float = 1.5 # 驻点窗口（降低候选数量）
+    split_top_ratio: float = 0.2     # 仅对top%高wave点进行分裂
+    split_min_wave_norm: float = 1e-4 # 触发分裂的最小wave阈值（降低以激活分裂）
+    split_max_extra_ratio: float = 0.15 # 分裂后额外点数不超过原始的比例，超出则跳过该次分裂
+    split_skip_center_minN: int = 500000 # 当仅有中心项且N>=该值时直接跳过分裂，避免无效复制
+    split_max_points_ratio: float = 1.10 # 分裂结果点数上限：超过 ratio*N 则视为过大，跳过
+    # 高频阶段的激活建议（可在训练时动态覆盖）：
+    split_top_ratio: float = 0.6
+    lambda_wave_reg: float = 1e-4
+    # 分裂模式：'precise' | 'parametric' | 'mixed'（训练/渲染用快速/参数化，导出用精确）
+    split_mode: str = 'mixed'
+    # 每次分裂调用的全局候选上限（按 wave 排序筛选），None 或 <=0 表示不限制
+    split_max_active_per_call: int = 100000
     
     def __post_init__(self):
         """验证配置的合理性"""

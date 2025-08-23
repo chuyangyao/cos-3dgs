@@ -616,8 +616,11 @@ def render_optimized(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
             shs = None
         else:
-            shs = torch.cat([split_data['split_features_dc'],
-                           split_data['split_features_rest']], dim=1)
+            # 修复：确保形状 [N, 3, SH]
+            shs = torch.cat([
+                split_data['split_features_dc'],
+                split_data['split_features_rest']
+            ], dim=1).transpose(1, 2).contiguous()
             colors_precomp = None
     else:
         # 不使用分裂
@@ -641,7 +644,8 @@ def render_optimized(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
             shs = None
         else:
-            shs = pc.get_features
+            # 修复：确保形状 [N, 3, SH]
+            shs = pc.get_features.transpose(1, 2).contiguous()
             colors_precomp = None
     
     # 光栅化

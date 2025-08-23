@@ -64,6 +64,8 @@ class SplitGaussianModel:
         self._split_factor = config.split_factor
         self._split_cache = {}
         self._split_cache_valid = False
+        # 参数化分裂：可训练的沿主轴缩放系数（初始为1.0）
+        self._split_sigma_alpha = nn.Parameter(torch.ones((0, 3), device="cuda"))
 
     def capture(self):
         return (
@@ -102,6 +104,12 @@ class SplitGaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        # 确保参数化分裂系数尺寸与点数一致
+        try:
+            num = self._xyz.shape[0]
+            self._split_sigma_alpha = nn.Parameter(torch.ones((num, 3), device="cuda").requires_grad_(True))
+        except Exception:
+            pass
 
     @property
     def get_scaling(self):
@@ -170,6 +178,8 @@ class SplitGaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._shape = nn.Parameter(shapes.requires_grad_(True))
         self._wave = nn.Parameter(wave.requires_grad_(True))
+        # 初始化参数化分裂系数
+        self._split_sigma_alpha = nn.Parameter(torch.ones((self.get_xyz.shape[0], 3), device="cuda").requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -204,7 +214,8 @@ class SplitGaussianModel:
             {'params': [self._shape], 'lr': training_args.shape_lr if hasattr(training_args, 'shape_lr') else 0.001, "name": "shape"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._wave], 'lr': wave_lr, "name": "wave"}
+            {'params': [self._wave], 'lr': wave_lr, "name": "wave"},
+            {'params': [self._split_sigma_alpha], 'lr': training_args.scaling_lr, "name": "split_alpha"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -268,7 +279,12 @@ class SplitGaussianModel:
         print(f"  Features DC shape: {f_dc.shape}")
         print(f"  Opacity range: [{opacities.min():.3f}, {opacities.max():.3f}]")
         wave_norms = np.linalg.norm(wave, axis=1)
-        print(f"  Wave active: {(wave_norms > 0.01).sum()}/{len(wave_norms)}")
+        try:
+            from config_manager import config_manager
+            thr = getattr(config_manager.config, 'wave_threshold', 1e-4)
+        except Exception:
+            thr = 1e-4
+        print(f"  Wave active: {(wave_norms > thr).sum()}/{len(wave_norms)} (thr={thr})")
 
     def load_ply(self, path):
         """修复后的load_ply方法，确保所有属性正确加载"""
@@ -338,13 +354,22 @@ class SplitGaussianModel:
         self._shape = nn.Parameter(torch.tensor(shapes, dtype=torch.float, device="cuda").requires_grad_(True))
         self._wave = nn.Parameter(torch.tensor(wave, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        # 初始化参数化分裂系数为 1（与点数对齐）
+        num = self._xyz.shape[0]
+        self._split_sigma_alpha = nn.Parameter(torch.ones((num, 3), device="cuda").requires_grad_(True))
+
         self.active_sh_degree = self.max_sh_degree
         
         # 打印加载信息
         print(f"[Load PLY] Loaded {xyz.shape[0]} gaussians from {path}")
         print(f"  Opacity range: [{opacities.min():.3f}, {opacities.max():.3f}]")
         wave_norms = np.linalg.norm(wave, axis=1)
-        print(f"  Wave active: {(wave_norms > 0.01).sum()}/{len(wave_norms)}")
+        try:
+            from config_manager import config_manager
+            thr = getattr(config_manager.config, 'wave_threshold', 1e-4)
+        except Exception:
+            thr = 1e-4
+        print(f"  Wave active: {(wave_norms > thr).sum()}/{len(wave_norms)} (thr={thr})")
 
     def invalidate_split_cache(self):
         """清除分裂缓存"""
@@ -360,21 +385,34 @@ class SplitGaussianModel:
 
     def get_split_data(self, iteration: int, max_iteration: int):
         """获取分裂数据用于渲染"""
-        from gaussian_renderer_optimized import vectorized_compute_splits_continuous_improved
+        from gaussian_renderer.splits import compute_splits_precise
         
         progress = min(iteration / max_iteration, 1.0) if max_iteration > 0 else 0.0
         
-        # 使用缓存机制
-        cache_key = f"{iteration}_{self._xyz.shape[0]}"
+        # 使用缓存机制（降低分裂计算频率）
+        from config_manager import config_manager
+        cfg = config_manager.config
+        interval = getattr(cfg, 'split_compute_interval', 5)
+        cache_key = f"{(iteration // max(1, interval))*interval}_{self._xyz.shape[0]}"
         if cache_key in self._split_cache and self._split_cache_valid:
             return self._split_cache[cache_key]
         
-        # 计算分裂数据
-        split_data = vectorized_compute_splits_continuous_improved(
-            self, 
-            max_splits_global=self._max_splits, 
-            progress=progress
+        # 计算分裂数据（优先精确实现，回退到旧实现由渲染层处理）
+        split_data = compute_splits_precise(
+            self,
+            iteration=iteration,
+            max_iteration=max_iteration,
+            max_k=self._max_splits
         )
+        # 回退：若精确分裂不可用，使用快速矢量化分裂以保证训练与渲染链路不断裂
+        if split_data is None:
+            try:
+                from gaussian_renderer_optimized import vectorized_compute_splits_continuous_improved
+                split_data = vectorized_compute_splits_continuous_improved(
+                    self, max_splits_global=self._max_splits, progress=progress
+                )
+            except Exception:
+                split_data = None
         
         # 缓存结果
         if split_data is not None:
@@ -385,6 +423,9 @@ class SplitGaussianModel:
 
     # 添加密集化相关方法
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        # 保护性处理：当grad尚未填充时，跳过本次累积，避免NoneType错误
+        if viewspace_point_tensor.grad is None:
+            return
         self.xyz_gradient_accum[update_filter] += torch.norm(
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )
@@ -404,7 +445,9 @@ class SplitGaussianModel:
         # 基于wave的策略
         if self.use_wave:
             wave_norms = torch.norm(self._wave[selected_pts_mask], dim=1)
-            wave_threshold = 0.5
+            # 降低阈值，避免过早把高频候选全部判为低波
+            from config_manager import config_manager
+            wave_threshold = getattr(config_manager.config, 'wave_threshold', 1e-4)
             need_wave_mask = wave_norms < wave_threshold
             need_split_mask = ~need_wave_mask
 
@@ -505,6 +548,8 @@ class SplitGaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._shape = optimizable_tensors["shape"]
         self._wave = optimizable_tensors["wave"]
+        if "split_alpha" in optimizable_tensors:
+            self._split_sigma_alpha = optimizable_tensors["split_alpha"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
@@ -523,7 +568,9 @@ class SplitGaussianModel:
             "scaling": new_scaling,
             "rotation": new_rotation,
             "shape": new_shape,
-            "wave": new_wave
+            "wave": new_wave,
+            # 新增的参数化分裂系数：为新增点初始化为 1
+            "split_alpha": torch.ones((new_xyz.shape[0], 3), device="cuda")
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -535,6 +582,8 @@ class SplitGaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._shape = optimizable_tensors["shape"]
         self._wave = optimizable_tensors["wave"]
+        if "split_alpha" in optimizable_tensors:
+            self._split_sigma_alpha = optimizable_tensors["split_alpha"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -564,22 +613,50 @@ class SplitGaussianModel:
                         torch.cat((group["params"][0], tensors_dict[group["name"]]), dim=0).requires_grad_(True)
                     )
                     optimizable_tensors[group["name"]] = group["params"][0]
+        # 确保 split_alpha 若未被 optimizer param_groups 捕获，则直接在模型上拼接
+        if "split_alpha" in tensors_dict and "split_alpha" not in optimizable_tensors:
+            self._split_sigma_alpha = nn.Parameter(torch.cat((self._split_sigma_alpha, tensors_dict["split_alpha"]), dim=0).requires_grad_(True))
+            optimizable_tensors["split_alpha"] = self._split_sigma_alpha
         return optimizable_tensors
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
+            # 对齐 mask 长度与当前参数长度
+            param_len = group["params"][0].shape[0]
+            if mask.shape[0] != param_len:
+                if mask.shape[0] > param_len:
+                    mask_adj = mask[:param_len]
+                else:
+                    pad = torch.zeros((param_len - mask.shape[0],), dtype=mask.dtype, device=mask.device)
+                    mask_adj = torch.cat([mask, pad], dim=0)
+            else:
+                mask_adj = mask
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask_adj]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask_adj]
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter((group["params"][0][mask_adj].requires_grad_(True)))
                 self.optimizer.state[group['params'][0]] = stored_state
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(group["params"][0][mask_adj].requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
+        # 确保 split_alpha 同步裁剪（若未在 optimizer 中）
+        if hasattr(self, "_split_sigma_alpha") and "split_alpha" not in optimizable_tensors:
+            # 与 xyz 长度对齐裁剪
+            param_len = self._split_sigma_alpha.shape[0]
+            if mask.shape[0] != param_len:
+                if mask.shape[0] > param_len:
+                    mask_adj2 = mask[:param_len]
+                else:
+                    pad2 = torch.zeros((param_len - mask.shape[0],), dtype=mask.dtype, device=mask.device)
+                    mask_adj2 = torch.cat([mask, pad2], dim=0)
+            else:
+                mask_adj2 = mask
+            self._split_sigma_alpha = nn.Parameter(self._split_sigma_alpha[mask_adj2].requires_grad_(True))
+            optimizable_tensors["split_alpha"] = self._split_sigma_alpha
         return optimizable_tensors
 
     def replace_tensor_to_optimizer(self, tensor, name):

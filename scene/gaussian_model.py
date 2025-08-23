@@ -281,7 +281,14 @@ class GaussianModel:
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
+        # PLY中历史可能保存为实际sigma或未激活参数，这里进行鲁棒处理：
+        ts = torch.tensor(scales, dtype=torch.float, device="cuda")
+        # 经验判别：若大部分值落在(0, 3]，且少于1%超过5，视为“实际sigma”，取对数；否则视为“未激活参数”
+        flat = ts.flatten()
+        high_ratio = (flat > 5.0).float().mean()
+        if (flat.median() <= 3.0) and (high_ratio < 0.01):
+            ts = torch.log(torch.clamp(ts, min=1e-6))
+        self._scaling = nn.Parameter(ts.requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._wave = nn.Parameter(torch.tensor(wave, dtype=torch.float, device="cuda").requires_grad_(True))
 

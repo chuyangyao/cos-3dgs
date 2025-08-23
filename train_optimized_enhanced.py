@@ -27,9 +27,10 @@ from utils.loss_utils import l1_loss, ssim
 from utils.image_utils import psnr
 
 # 导入修复模块
-from config_manager import config_manager
+from config_manager import config_manager as CFG_MGR
 from checkpoint_manager import CheckpointManager
 from debug_validator import debug_validator
+from gaussian_renderer_optimized import process_gradients_optimized
 
 # TensorBoard
 try:
@@ -49,6 +50,36 @@ def prepare_output_and_logger(args):
     
     print(f"Output folder: {args.model_path}")
     os.makedirs(args.model_path, exist_ok=True)
+
+    # 将控制台输出同时写入文件（完整训练日志）
+    log_path = os.path.join(args.model_path, "train_full.log")
+    class _Tee:
+        def __init__(self, stream_a, filepath):
+            self._a = stream_a
+            self._f = open(filepath, 'a', buffering=1)
+        def write(self, msg):
+            try:
+                self._a.write(msg)
+            except Exception:
+                pass
+            try:
+                self._f.write(msg)
+            except Exception:
+                pass
+        def flush(self):
+            try:
+                self._a.flush()
+            except Exception:
+                pass
+            try:
+                self._f.flush()
+            except Exception:
+                pass
+    try:
+        sys.stdout = _Tee(sys.stdout, log_path)
+        sys.stderr = _Tee(sys.stderr, log_path)
+    except Exception as e:
+        print(f"[Logger] Failed to tee stdout/stderr: {e}")
     
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
@@ -76,7 +107,7 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
     scene = Scene(dataset, gaussians)
     
     # 更新全局配置
-    config_manager.update_config(
+    CFG_MGR.update_config(
         use_splitting=opt.use_splitting if hasattr(opt, 'use_splitting') else True,
         max_splits=opt.max_splits if hasattr(opt, 'max_splits') else 10,
         wave_lr=opt.wave_lr if hasattr(opt, 'wave_lr') else 0.01,
@@ -109,8 +140,8 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
-    # 获取配置
-    config = config_manager.config
+    # 获取配置（数值从 config_manager.config 取；方法从 config_manager 调用）
+    config = CFG_MGR.config
     
     # 训练循环
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -125,12 +156,19 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
         
         iter_start.record()
         
-        # 获取当前阶段
-        phase = config.get_phase(iteration)
+        # 获取当前阶段（调试开关，默认关闭）
+        if os.environ.get("DEBUG_FORCE_HIGH_FREQ", "0") == "1":
+            phase = "high_freq"
+        else:
+            phase = CFG_MGR.get_phase(iteration)
         
         # 更新模型状态
-        gaussians.use_wave = config.should_use_wave(iteration)
-        gaussians.use_splitting = config.should_use_splitting(iteration)
+        if phase == "high_freq":
+            gaussians.use_wave = True
+            gaussians.use_splitting = True
+        else:
+            gaussians.use_wave = CFG_MGR.should_use_wave(iteration)
+            gaussians.use_splitting = CFG_MGR.should_use_splitting(iteration)
         
         # 阶段转换处理
         if iteration == config.phase1_end + 1:
@@ -166,8 +204,14 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
                 print(f"  max_splits: {gaussians._max_splits}")
             if hasattr(gaussians, '_wave'):
                 wave_norms = torch.norm(gaussians._wave, dim=1)
-                print(f"  Active waves: {(wave_norms > 0.01).sum()}/{len(wave_norms)}")
+                thr = getattr(CFG_MGR.config, 'wave_threshold', 1e-4)
+                print(f"  Active waves: {(wave_norms > thr).sum()}/{len(wave_norms)} (thr={thr})")
             print(f"{'='*60}")
+            # 提升高频阶段wave学习率，降低正则，点燃分裂
+            for param_group in gaussians.optimizer.param_groups:
+                if param_group["name"] == "wave":
+                    param_group['lr'] *= 2.0
+            CFG_MGR.update_config(lambda_wave_reg=max(1e-5, config.lambda_wave_reg * 0.5))
             torch.cuda.empty_cache()
         
         # 学习率调度
@@ -182,9 +226,11 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
                     else:
                         base_lr = config.wave_lr
                     
-                    # Cosine衰减
+                    # Cosine衰减 + 下限
                     progress = (iteration - config.phase1_end) / (opt.iterations - config.phase1_end)
                     lr = base_lr * (0.5 * (1 + np.cos(np.pi * progress)))
+                    lr_min_factor = 0.2  # 不低于基础学习率的20%
+                    lr = max(lr, base_lr * lr_min_factor)
                     param_group['lr'] = lr
         
         # SH degree增加
@@ -236,6 +282,9 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
             # 密集化
             if iteration < opt.densify_until_iter:
                 # 更新视空间点梯度
+                # 若使用分裂，先将分裂屏幕点的梯度聚合回原始points
+                if "split_viewspace_points" in render_pkg and render_pkg["split_viewspace_points"] is not None:
+                    process_gradients_optimized(render_pkg, gaussians)
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter]
@@ -268,6 +317,8 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
                 # 重置不透明度
                 if iteration % opt.opacity_reset_interval == 0:
                     gaussians.reset_opacity()
+            elif iteration == opt.densify_until_iter:
+                print(f"[Densify] Stop densify/prune after iter {opt.densify_until_iter}")
             
             # 优化器步进
             gaussians.optimizer.step()
@@ -293,7 +344,7 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
                 debug_validator.check_memory_usage(f"iter_{iteration}")
                 
                 # 打印配置状态
-                config_manager.log_status(iteration, gaussians)
+                CFG_MGR.log_status(iteration, gaussians)
             
             # 定期清理内存
             if iteration % 1000 == 0:
@@ -305,7 +356,8 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
                     if wave_norms is not None:
                         print(f"\n[Stats] Iteration {iteration}:")
                         print(f"  Gaussians: {gaussians._xyz.shape[0]}")
-                        print(f"  Active waves: {(wave_norms > 0.01).sum().item()}")
+                        thr = getattr(CFG_MGR.config, 'wave_threshold', 1e-4)
+                        print(f"  Active waves: {(wave_norms > thr).sum().item()} (thr={thr})")
                         print(f"  Mean wave norm: {wave_norms.mean().item():.4f}")
                         print(f"  Max wave norm: {wave_norms.max().item():.4f}")
             
@@ -320,7 +372,8 @@ def training_optimized_enhanced(dataset, opt, pipe, testing_iterations, saving_i
                     wave_norms = torch.norm(gaussians._wave, dim=1)
                     tb_writer.add_scalar('wave/mean_norm', wave_norms.mean().item(), iteration)
                     tb_writer.add_scalar('wave/max_norm', wave_norms.max().item(), iteration)
-                    tb_writer.add_scalar('wave/active_count', (wave_norms > 0.01).sum().item(), iteration)
+                    thr = getattr(CFG_MGR.config, 'wave_threshold', 1e-4)
+                    tb_writer.add_scalar('wave/active_count', (wave_norms > thr).sum().item(), iteration)
     
     # 训练结束
     print("\n" + "="*60)

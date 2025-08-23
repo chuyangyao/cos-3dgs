@@ -171,35 +171,48 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         
         # 根据模型类型加载
         if model_info['has_wave']:
-            # 加载带wave的模型
-            if 'laplacian' in model_info['model_type']:
-                gaussians = SplitLaplacianModel(dataset.sh_degree)
-            else:
-                gaussians = SplitGaussianModel(dataset.sh_degree)
-                
-            # 如果要使用预分裂版本
+            # 使用带 wave 的模型
             if use_presplit and model_info['has_split']:
                 print("\n使用预分裂的高斯进行高效渲染...")
-                # 加载预分裂版本
+                # 预分裂路径：标准 GaussianModel 加载 split PLY，禁用动态分裂
                 split_path = os.path.join(
                     dataset.model_path,
                     "point_cloud",
                     f"iteration_{iteration}",
                     "point_cloud_split.ply"
                 )
-                
-                # 创建标准高斯模型加载分裂版本
                 gaussians = GaussianModel(dataset.sh_degree)
                 scene = Scene(dataset, gaussians, shuffle=False)
                 gaussians.load_ply(split_path)
-                gaussians.use_splitting = False  # 禁用动态分裂
-                
-                # 读取分裂信息
+                gaussians.use_splitting = False
                 split_info = model_info.get('split_info')
-            else:
-                print("\n使用动态分裂渲染...")
+            elif use_presplit and not model_info['has_split']:
+                # 新增：允许用户选择标准点云（未分裂）进行渲染，便于对比
+                standard_path = os.path.join(
+                    dataset.model_path,
+                    "point_cloud",
+                    f"iteration_{iteration}",
+                    "point_cloud.ply"
+                )
+                print("\n未找到预分裂文件，改用未分裂点云进行渲染（禁用动态分裂）...")
+                gaussians = GaussianModel(dataset.sh_degree)
                 scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-                gaussians.use_splitting = True  # 启用动态分裂
+                gaussians.load_ply(standard_path)
+                gaussians.use_splitting = False
+                split_info = None
+            elif use_presplit and not model_info['has_split']:
+                # 显式兜底：用户要求预分裂，但不存在分裂文件 -> 回退为标准渲染（无动态分裂）
+                print("\n未找到预分裂文件，回退为标准渲染（禁用动态分裂）...")
+                gaussians = GaussianModel(dataset.sh_degree)
+                scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+                gaussians.use_splitting = False
+                split_info = None
+            else:
+                # 正常动态路径（仅当未要求预分裂）
+                print("\n使用动态分裂渲染...")
+                gaussians = SplitGaussianModel(dataset.sh_degree)
+                scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+                gaussians.use_splitting = True
                 split_info = None
         else:
             # 标准高斯模型
